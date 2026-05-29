@@ -17,6 +17,27 @@ named relationship — `1` means exactly one, `0..1` zero or one,
 
 ## Nodes
 
+### `AnalysisReport`
+
+Latest Project Doctor analysis report for a project. Replaced wholesale
+each time the Doctor runs.
+
+- Indexes: `id` (unique), `project_id`
+- Outgoing relationships:
+  - `-[:HAS_RESULT]->(:AnalysisResult)` — cardinality `0..*`
+- Incoming relationships:
+  - `(:Project)-[:HAS_ANALYSIS_REPORT]->` — cardinality `1`
+
+### `AnalysisResult`
+
+A single finding emitted by an analysis plugin, attached to its parent
+report. Properties: `slug`, `title`, `description` (markdown),
+`status` (`pass`/`warn`/`fail`), `plugin_slug`, `plugin_id`.
+
+- Indexes: `report_id`, `slug`
+- Incoming relationships:
+  - `(:AnalysisReport)-[:HAS_RESULT]->` — cardinality `1`
+
 ### `APIKey`
 
 Programmatic-access credential.
@@ -198,6 +219,8 @@ A managed service / application.
   - `-[:EXISTS_IN {identifier, canonical_link}]->(:ThirdPartyService)` — cardinality `0..*`
   - `-[:USES_PLUGIN {…}]->(:Plugin)` — cardinality `0..*` (project-level
     plugin overrides)
+  - `-[:HAS_ANALYSIS_REPORT]->(:AnalysisReport)` — cardinality `0..1`
+    (only the latest report is retained)
 - Incoming relationships:
   - `(:Document)-[:ATTACHED_TO]->` — cardinality `0..*`
   - `(:Project)-[:DEPENDS_ON]->` — cardinality `0..*` (inverse)
@@ -408,6 +431,8 @@ others are created with hand-written Cypher.
 | --- | --- | --- | --- |
 | `:ACTIONS` | `WebhookRule` → `Webhook` | `endpoints/webhooks.py` | none (rule ordinal lives on the source node) |
 | `:ATTACHED_TO` | `Document` → `Project` | `models.Document.project` | none |
+| `:HAS_ANALYSIS_REPORT` | `Project` → `AnalysisReport` | `endpoints/project_analysis.py` | none (latest-only; delete+create on re-run) |
+| `:HAS_RESULT` | `AnalysisReport` → `AnalysisResult` | `endpoints/project_analysis.py` | none |
 | `:BELONGS_TO` | `Team` → `Organization` | `models.Team.organization` | none |
 | `:BELONGS_TO` | `Environment` → `Organization` | `models.Environment.organization` | none |
 | `:BELONGS_TO` | `ProjectType` → `Organization` | `models.ProjectType.organization` | none |
@@ -499,6 +524,14 @@ Composite indexes share a marker across their member attributes.
 
 ```mermaid
 erDiagram
+    AnalysisReport {
+        string id UK
+        string project_id "indexed"
+    }
+    AnalysisResult {
+        string report_id "indexed"
+        string slug "indexed"
+    }
     APIKey {
         string key_id UK
         boolean revoked "indexed"
@@ -610,6 +643,7 @@ erDiagram
     WebhookRule {
     }
 
+    AnalysisReport    ||--o{ AnalysisResult    : "HAS_RESULT (0..*)"
     APIKey            ||--o| User              : "OWNED_BY (0..1)"
     APIKey            ||--o| ServiceAccount    : "OWNED_BY (0..1)"
     ClientCredential  ||--o| ServiceAccount    : "OWNED_BY (0..1)"
@@ -629,6 +663,7 @@ erDiagram
     Project           ||--o{  Project          : "DEPENDS_ON (0..*)"
     Project           ||--o{  ThirdPartyService : "EXISTS_IN (0..*)"
     Project           ||--o{  Plugin           : "USES_PLUGIN (0..*)"
+    Project           ||--o|  AnalysisReport   : "HAS_ANALYSIS_REPORT (0..1)"
     ProjectType       ||--||  Organization     : "BELONGS_TO (1)"
     ProjectType       ||--o{  Plugin           : "USES_PLUGIN (0..*)"
     Release           ||--o{  Environment      : "DEPLOYED_TO (0..*)"
