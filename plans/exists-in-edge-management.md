@@ -18,20 +18,32 @@ ThirdPartyService slug. A new **`imbi-plugin-doctor`** package adds the
 first `AnalysisPlugin`: a generic, config-driven checker that flags
 edges whose canonical/dashboard URLs 404 or whose identifier disagrees
 with the canonical URL's payload — the tool for finding the bad migrated
-edges. The **API** surfaces edge identifiers (merged into `identifiers`)
-and canonical URLs (a new map) on the project response.
+edges. The **API** surfaces edge data as a read-only `services` list on
+the project response (see the Surface correction below — an earlier
+identifiers-merge was reverted).
 
-This feature ships in **two PR sets** (one feature):
+This ships as **one correlated PR set** (edge plumbing + Integrations
+panel together) to avoid a half-state where the project response
+surfaces edge data with no UI to manage it. See **PR Set 2** below for
+the panel + the `/services` dashboard-URL fold.
 
-- **PR Set 1 — edge plumbing** *(implemented)*: the `ServiceWriteback`
-  contract, imbi-api persistence/surfacing + rename, GitHub writeback +
-  read-path migration, `imbi-plugin-doctor`, and the migration script.
-- **PR Set 2 — Integrations panel**: fold the dashboard URL into the
-  `/services` endpoints (imbi-api), then a new imbi-ui **Integrations**
-  Project Settings panel (table of one row per `EXISTS_IN` edge:
-  service / identifier / API URL / dashboard URL, with add/remove). This
-  is the UI home that answers "link an existing project to an existing
-  repo." See **PR Set 2** below.
+### Surface correction (after real usage)
+
+The first cut **merged** edge identifiers into the project's
+`identifiers` map (edge-wins). Real usage showed the footgun: editing a
+service identifier in the Identifiers card PATCHes the *node* map, but
+the response re-injects the *edge* value, so the edit silently appears
+to do nothing — and the merged key renders as an editable row forever.
+So the merge is **dropped**:
+
+- `identifiers` is the node property only (no edge merge); the editable
+  map and the service relationship never collide.
+- Edge data is surfaced as a read-only **`services`** list on
+  `ProjectResponse` (`{service_slug, service_name, identifier,
+  canonical_url, dashboard_url}`), replacing the earlier `canonical_urls`
+  map. `dashboard_url` is read from `Project.links[slug]`.
+- Service identifiers are edited in the **Integrations** panel (which
+  writes the edge), not the Identifiers card.
 
 SonarQube/Sentry plugin adoption and the plugin-backed *"Add from
 service"* resolve (`on_project_assigned`) remain deferred fast-follows.
@@ -57,9 +69,9 @@ service"* resolve (`on_project_assigned`) remain deferred fast-follows.
   `models.Project` leak.
 - **Missing/insufficient credentials → Doctor `skip`/`warn`, never
   `fail`** (analysis fan-out already returns `{}` on missing creds).
-- Edge identifier surfaced **as-is (string)**; on key collision in the
-  `identifiers` map, **the edge wins**, merged read-only at
-  serialization (not persisted to the node).
+- Edge identifier surfaced **as-is (string)** in the read-only
+  `services` list. **Not merged into `identifiers`** (see Surface
+  correction) — `identifiers` stays the node-only editable map.
 - `edge_labels` is unrelated and out of scope.
 
 ## Key findings from exploration (grounding)
@@ -136,18 +148,19 @@ service"* resolve (`on_project_assigned`) remain deferred fast-follows.
   - `_build_context` (`:92`): inject `third_party_service_slug` +
     `service_connections` (add `lookup_project_exists_in`).
 - `src/imbi_api/endpoints/projects.py`
-  - `_RETURN_FRAGMENT` + slim fragment (`:845-902`): `OPTIONAL MATCH
+  - `_RETURN_FRAGMENT`: `OPTIONAL MATCH
     (p)-[ei:EXISTS_IN]->(tps:ThirdPartyService)` and `collect({slug,
-    identifier, canonical_url})`.
-  - `ProjectResponse` (`:214-258`): merge edge `identifier` into
-    `identifiers` keyed by TPS slug (edge wins); add new
-    `canonical_urls: dict[str, str] = {}` keyed by TPS slug.
+    name, identifier, canonical_url})` as `service_edges`.
+  - `ProjectResponse`: `_build_services` validator turns `service_edges`
+    (+ the dashboard URL from `links`) into a read-only
+    `services: list[ExistsInResponse]`. `identifiers` is left untouched
+    (no merge); the old `canonical_urls` map is removed.
 - `src/imbi_api/endpoints/webhooks.py` + `src/imbi_api/domain/models.py`
   - Rename `canonical_link` → `canonical_url` in the 3 EXISTS_IN queries
     and in `ExistsInCreate` / `ExistsInResponse` (`:1268-1286`).
 - Tests: `persist_service_writeback` (upsert/remove/links-merge),
   resolution TPS-slug surfacing, lifecycle capture+persist, analysis
-  context injection, `ProjectResponse` surfacing + collision precedence,
+  context injection, `ProjectResponse` `services` surfacing,
   EXISTS_IN endpoints under the renamed property.
 
 ### imbi-plugin-github
@@ -270,9 +283,10 @@ the panel is one call per row.
 - imbi-api: `persist_service_writeback` upsert + `remove` + dashboard
   merge; resolution surfaces `third_party_service_slug` for lifecycle &
   analysis; lifecycle dispatch captures+persists the writeback; analysis
-  `_build_context` injects connections; `ProjectResponse` returns
-  `canonical_urls` and merged `identifiers` (edge-wins collision);
-  EXISTS_IN endpoints pass under `canonical_url`.
+  `_build_context` injects connections; `ProjectResponse` returns the
+  `services` list (with `dashboard_url` from links) and leaves
+  `identifiers` untouched; EXISTS_IN endpoints fold `dashboard_url`
+  (create writes the link, delete clears it) under `canonical_url`.
 - imbi-plugin-github: each hook emits the right `ServiceWriteback`;
   read-path TPS-slug + legacy fallback.
 - imbi-plugin-doctor: pass/warn/fail/skip matrix (URL 404, identifier
@@ -288,8 +302,9 @@ the panel is one call per row.
      create a project. Confirm an `EXISTS_IN` edge exists with the
      numeric `identifier` and the `/repositories/{id}` `canonical_url`,
      and a dashboard link under the TPS slug in `links`.
-     `curl -f .../projects/{id}` shows the id in `identifiers` and the
-     API URL in `canonical_urls`.
+     `curl -f .../projects/{id}` shows a `services` entry with the id,
+     `/repositories/{id}` `canonical_url`, and the dashboard URL —
+     and `identifiers` is unchanged.
   2. Attach `imbi-plugin-doctor` to the same TPS with
      `identifier_pointer=/id`; run analysis
      (`POST .../projects/{id}/analysis`). Confirm `pass` for a good
