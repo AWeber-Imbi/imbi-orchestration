@@ -227,3 +227,59 @@ keeping the keying compatible so we can adopt it later.
   candidates for the generic Doctor.
 - **imbi-ui** — render canonical/dashboard data on the project view;
   regenerate `api-generated.ts` after the API schema changes.
+
+## Pivot: an "Integrations" panel as the UI home for EXISTS_IN
+
+After the edge plumbing landed, the question *"how do I link an existing
+project to an existing repo?"* surfaced the real gap: the `EXISTS_IN`
+CRUD (`GET/POST/DELETE …/projects/{id}/services/`) has **no UI**, and a
+project's `EXISTS_IN` relationships are invisible in Project Settings.
+
+Rather than a standalone lifecycle "assign" action, we'll add a new
+**Integrations** panel to Project Settings — a table, one row per
+`EXISTS_IN` edge, showing **third-party service / identifier / API
+(canonical) URL / dashboard URL**, with **add / remove** controls. This
+gives the project↔service relationship a first-class home alongside the
+existing (and deliberately distinct) **Links** and **Identifiers**
+cards, and the add/remove controls deliver the "link an existing repo"
+functionality directly.
+
+Decisions for this pivot:
+
+- **Name: "Integrations."** Chosen over "Services" (which reads as a
+  shortening of "Third-Party Services"). Note: the team is *separately*
+  considering renaming the admin **Third-Party Services** section to
+  **Integrations** in the future — to be discussed with the team; not
+  part of this feature.
+- **Fold the dashboard URL into the `/services` endpoints.** The
+  dashboard URL lives in `Project.links` keyed by the service slug, not
+  on the edge. Extend `ExistsInResponse` to also return
+  `dashboard_url` (the matching `Project.links[slug]`) and
+  `ExistsInCreate` to accept an optional `dashboard_url` the handler
+  writes into `links`. One row → one API call → both stores, so the
+  edge is the single source of truth for the relationship and its two
+  URLs. Do this **first**.
+- **Manual entry first; plugin "Add from service" as a follow-up.** The
+  raw CRUD already supports manual rows. For GitHub the canonical URL is
+  the id-based `/repositories/{id}` form, which is miserable to type by
+  hand — so the eventual ergonomic win is an *"Add from service"*
+  button backed by the lifecycle plugin (`on_project_assigned`: paste
+  `owner/repo`, the plugin GETs it and fills identifier + API URL +
+  dashboard URL). That hook is deferred behind the manual panel; the
+  panel is its home rather than a standalone endpoint.
+
+### Two PR sets (one feature)
+
+This stays a single feature for planning, implemented in two PR sets:
+
+1. **Edge plumbing** *(implemented)* — the `ServiceWriteback` contract,
+   imbi-api persistence/surfacing + `canonical_link`→`canonical_url`
+   rename, GitHub writeback + read-path migration, the
+   `imbi-plugin-doctor` analysis plugin, and the rename migration
+   script.
+2. **Integrations panel** — fold `dashboard_url` into the `/services`
+   endpoints (imbi-api), the new imbi-ui **Integrations** Project
+   Settings panel (table + add/remove), and the `api-generated.ts`
+   regen. The plugin `on_project_assigned` "Add from service" resolve
+   is a fast-follow within this feature, not a prerequisite for the
+   panel.

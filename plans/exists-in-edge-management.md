@@ -21,8 +21,20 @@ with the canonical URL's payload — the tool for finding the bad migrated
 edges. The **API** surfaces edge identifiers (merged into `identifiers`)
 and canonical URLs (a new map) on the project response.
 
-First pass scope: **Core + GitHub + Doctor** — SonarQube/Sentry plugin
-adoption and a dedicated services UI are deferred.
+This feature ships in **two PR sets** (one feature):
+
+- **PR Set 1 — edge plumbing** *(implemented)*: the `ServiceWriteback`
+  contract, imbi-api persistence/surfacing + rename, GitHub writeback +
+  read-path migration, `imbi-plugin-doctor`, and the migration script.
+- **PR Set 2 — Integrations panel**: fold the dashboard URL into the
+  `/services` endpoints (imbi-api), then a new imbi-ui **Integrations**
+  Project Settings panel (table of one row per `EXISTS_IN` edge:
+  service / identifier / API URL / dashboard URL, with add/remove). This
+  is the UI home that answers "link an existing project to an existing
+  repo." See **PR Set 2** below.
+
+SonarQube/Sentry plugin adoption and the plugin-backed *"Add from
+service"* resolve (`on_project_assigned`) remain deferred fast-follows.
 
 ## Decisions (confirmed)
 
@@ -180,7 +192,7 @@ adoption and a dedicated services UI are deferred.
 - Update `imbi-orchestration/notes/imbi-api-graph-schema.md` (EXISTS_IN
   property rename + that edges are now plugin-maintained).
 
-## Implementation outline (dependency order)
+## Implementation outline — PR Set 1 (edge plumbing) *(implemented)*
 
 1. **imbi-common** — `ServiceWriteback`, `ServiceConnection`,
    `PluginContext` fields, exports, docs, round-trip tests. (No new
@@ -195,9 +207,61 @@ adoption and a dedicated services UI are deferred.
 4. **imbi-plugin-doctor** — scaffold package + the analysis plugin +
    tests. Lint + test.
 5. **imbi-ui** — regenerate `api-generated.ts` against the running API
-   (user owns `npm run codegen:fetch`); no new components this pass.
+   (user owns `npm run codegen:fetch`); no new components this set.
 6. **Operational** — migration script + schema-note update (separate,
    run against the target graph; not a code PR gate).
+
+## PR Set 2 — Integrations panel
+
+A new **Integrations** panel in Project Settings: a table with one row
+per `EXISTS_IN` edge (third-party service / identifier / API URL /
+dashboard URL) and add/remove controls. It sits beside the existing
+**Links** and **Identifiers** cards and is the UI home for linking an
+existing project to an existing repo. (Naming: "Integrations" — note a
+*separate* future discussion about renaming the admin **Third-Party
+Services** section to "Integrations"; out of scope here.)
+
+### Step 1 — fold the dashboard URL into the `/services` endpoints (do first)
+
+The dashboard URL lives in `Project.links` keyed by the service slug,
+not on the edge. Make the `EXISTS_IN` row a single coherent resource so
+the panel is one call per row.
+
+- `imbi-api/.../domain/models.py` — `ExistsInResponse`: add
+  `dashboard_url: str | None`. `ExistsInCreate`: add optional
+  `dashboard_url: str | None`.
+- `imbi-api/.../endpoints/webhooks.py` (project-services router):
+  - **list / create** queries: also return the matching
+    `Project.links[slug]` as `dashboard_url` (read the links map, or
+    `OPTIONAL`-join it), reusing `lookup_project_links`.
+  - **create** (`POST`): when `dashboard_url` is supplied, merge it into
+    `Project.links` keyed by the service slug (reuse
+    `_helpers.merge_project_links`) in the same handler that MERGEs the
+    edge.
+  - **delete**: drop the matching `Project.links[slug]` entry alongside
+    the edge (reuse `merge_project_links(remove=[slug])`).
+  - Consider a `PUT`/`PATCH /{service_slug}` for editing a row in place
+    (identifier / API URL / dashboard URL) so the panel can edit, not
+    only add+remove.
+- Tests: list returns `dashboard_url` from links; create writes the edge
+  **and** the link; delete clears both.
+
+### Step 2 — imbi-ui Integrations panel
+
+- New component (e.g. `IntegrationsCard.tsx`) mirroring `EditLinksCard` /
+  `EditIdentifiersCard`, wired into `ProjectSettingsTab.tsx`.
+- Table columns: service (select from the org's `ThirdPartyService`s),
+  identifier, API (canonical) URL, dashboard URL; add + remove rows
+  against `…/projects/{id}/services/`.
+- Regenerate `api-generated.ts` (`npm run codegen:fetch`; user owns the
+  regen step) after the Step 1 schema change.
+- Tests: per the UI's component-test conventions.
+
+> The plugin-backed *"Add from service"* button (paste `owner/repo` →
+> the lifecycle plugin GETs it and fills identifier + API URL +
+> dashboard URL via `on_project_assigned`) is a **fast-follow** within
+> this feature, not a prerequisite — manual entry ships first. See
+> Deferred.
 
 ## Tests
 
@@ -236,11 +300,26 @@ adoption and a dedicated services UI are deferred.
 - Migration: run the rename script against a copy of the graph; confirm
   no `canonical_link` remain and `/services` + project responses read
   correctly.
+- **PR Set 2:** `POST …/projects/{id}/services/` with a `dashboard_url`
+  writes both the `EXISTS_IN` edge and `Project.links[slug]`; `GET`
+  returns `dashboard_url`; `DELETE` clears both. In the UI, the
+  Integrations panel lists existing edges and add/remove round-trips
+  against those endpoints.
 
-## Deferred (future passes)
+## Deferred (fast-follows / future passes)
 
+- **Plugin-backed "Add from service"** — `LifecyclePlugin.on_project_assigned`
+  (+ `'assigned'` in `lifecycle_events`, an inbound `external_reference`
+  context field, and a targeted host dispatch that resolves the chosen
+  lifecycle plugin by its TPS `HAS_PLUGIN` rather than `USES_PLUGIN`).
+  Powers an "Add from service" button in the Integrations panel: paste
+  `owner/repo`, the plugin GETs it and fills identifier + API URL +
+  dashboard URL. Earns its keep because GitHub's id-based
+  `/repositories/{id}` canonical URL is miserable to type by hand.
 - SonarQube / Sentry plugins managing their own `EXISTS_IN` edges.
-- A dedicated imbi-ui services card (view/manage EXISTS_IN, surface
-  Doctor findings, derive dashboard links from `LinkDefinition.url_template`).
+- Surfacing Doctor findings in the Integrations panel; deriving
+  dashboard links from `LinkDefinition.url_template`.
+- Renaming the admin **Third-Party Services** section to
+  **Integrations** (team discussion; separate from this feature).
 - Retiring the legacy `github-repository` link key once all consumers
   read the TPS-slug-keyed dashboard link.
