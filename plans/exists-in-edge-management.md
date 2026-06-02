@@ -1,0 +1,246 @@
+# Plan: Plugin-managed EXISTS_IN edges + a Doctor analysis plugin
+
+## Context
+
+A project's relationship to a third-party service (GitHub, SonarQube,
+Sentry) is modelled as a `(:Project)-[:EXISTS_IN]->(:ThirdPartyService)`
+edge carrying an `identifier` and a `canonical_link`. Today these edges
+are hand-entered (and many migrated from v1 are wrong — pointing at
+dashboard URLs, disagreeing with the `github-repository` link). The
+GitHub plugin maintains none of it; it writes a `github-repository`
+entry into `Project.links` via the `LinkWriteback` side-channel.
+
+This feature makes **lifecycle plugins own the `EXISTS_IN` edge** — the
+`identifier` and the **canonical API URL** (the JSON-returning one, which
+for GitHub is the rename-stable `/repositories/{id}` form) — while the
+human **dashboard URL** moves to `Project.links` keyed by the
+ThirdPartyService slug. A new **`imbi-plugin-doctor`** package adds the
+first `AnalysisPlugin`: a generic, config-driven checker that flags
+edges whose canonical/dashboard URLs 404 or whose identifier disagrees
+with the canonical URL's payload — the tool for finding the bad migrated
+edges. The **API** surfaces edge identifiers (merged into `identifiers`)
+and canonical URLs (a new map) on the project response.
+
+First pass scope: **Core + GitHub + Doctor** — SonarQube/Sentry plugin
+adoption and a dedicated services UI are deferred.
+
+## Decisions (confirmed)
+
+- **Doctor = a new `imbi-plugin-doctor` package** containing an
+  `AnalysisPlugin` (reuse the existing `analysis` plugin_type; no new
+  type, no registry changes). It checks links against identifiers.
+- **Rename the edge property `canonical_link` → `canonical_url`** (it is
+  now specifically the API URL). One-time graph data migration + code
+  rename.
+- **Canonical URL = API URL** (returns JSON); **dashboard URL = a
+  `Project.links` entry** keyed by ThirdPartyService slug.
+- **Map keys = ThirdPartyService slug** for identifiers, canonical URLs,
+  and dashboard links. The slug is host-injected into `PluginContext`.
+- **The host owns the plugin↔TPS binding.** A plugin writes back the
+  edge for *its own* bound service (resolved via
+  `(:ThirdPartyService)-[:HAS_PLUGIN]->(:Plugin)`); it cannot target an
+  arbitrary service. So `ServiceWriteback` carries no `service_slug`.
+- **Writeback stays pure data** (`ServiceWriteback`), not callables. The
+  Doctor reads an enriched `PluginContext`, not a host-callable / no
+  `models.Project` leak.
+- **Missing/insufficient credentials → Doctor `skip`/`warn`, never
+  `fail`** (analysis fan-out already returns `{}` on missing creds).
+- Edge identifier surfaced **as-is (string)**; on key collision in the
+  `identifiers` map, **the edge wins**, merged read-only at
+  serialization (not persisted to the node).
+- `edge_labels` is unrelated and out of scope.
+
+## Key findings from exploration (grounding)
+
+- Lifecycle plugins resolve via `USES_PLUGIN {tab:'lifecycle'}`
+  (`resolution.py:resolve_all_plugins`), which does **not** return the
+  TPS — but the plugin instance is attached to exactly one TPS via
+  `HAS_PLUGIN`, so an `OPTIONAL MATCH (tps)-[:HAS_PLUGIN]->(p)` yields
+  the bound slug.
+- Analysis plugins already discover via the TPS `HAS_PLUGIN` path and
+  carry `Plugin.options` (`resolution.py:432-587`); `tps` is bound in
+  that query but its slug isn't collected yet.
+- The EXISTS_IN upsert/list/delete already exist in
+  `imbi-api/.../endpoints/webhooks.py:708-884` (reuse the MERGE at
+  782-794).
+- Link-writeback machinery to mirror:
+  `lifecycle_dispatch.py` capture+persist (`245-294`),
+  `_helpers.py:persist_link_writeback`/`update_project_link`
+  (`218-282`), `build_lifecycle_context_bundle` (`73-123`).
+- `imbi_common.json_pointer.JsonPointer` (RFC-6901) exists for
+  identifier extraction. **No `AnalysisPlugin` implementations exist
+  yet** — Doctor is the first.
+- No UI consumes `/services` / EXISTS_IN today; `ProjectResponse.links`
+  & `.identifiers` are flat dicts rendered by `EditLinksCard` /
+  `EditIdentifiersCard`. UI work is limited to regenerating types.
+
+## Critical files
+
+### imbi-common (shared contract — affects gateway/mcp; `--strict` docs)
+- `src/imbi_common/plugins/base.py`
+  - Add `ServiceWriteback(identifier, canonical_url,
+    dashboard_links: dict[str,str]={}, remove: bool=False)` beside
+    `LinkWriteback` (`:252`).
+  - Add `ServiceConnection(service_slug, identifier, canonical_url)`.
+  - `PluginContext` (`:286-311`): add `service_writeback:
+    ServiceWriteback | None = None` (write side),
+    `third_party_service_slug: str | None = None` and
+    `service_connections: list[ServiceConnection] = []` (read side,
+    host-injected).
+- `src/imbi_common/plugins/__init__.py` — export the new public classes
+  (needed for `--strict` doc reference).
+- `docs/plugins/index.md` + `docs/plugins/lifecycle.md` — document
+  `ServiceWriteback`, the context additions, and the host-owned binding.
+- Tests: extend `tests/test_plugins/test_base.py` (msgpack round-trip of
+  the new context fields, mirroring the `LinkWriteback` case at `:532`).
+
+### imbi-api
+- `src/imbi_api/endpoints/_helpers.py`
+  - Add `lookup_project_exists_in(db, project_id) ->
+    list[ServiceConnection]` (query mirrors `webhooks.py:729-739`, reads
+    `canonical_url`).
+  - Add `persist_service_writeback(db, ctx)`: if `ctx.service_writeback`
+    and `ctx.third_party_service_slug` set — `remove` → DELETE edge +
+    drop dashboard keys from `p.links`; else MERGE edge (reuse
+    `webhooks.py:782-794`, set `identifier`+`canonical_url`) and merge
+    `dashboard_links` into `p.links` (reuse `update_project_link`).
+    Best-effort/logged/swallowed like `persist_link_writeback`.
+- `src/imbi_api/plugins/resolution.py`
+  - `resolve_all_plugins`: add `OPTIONAL MATCH
+    (tps:ThirdPartyService)-[:HAS_PLUGIN]->(p)` and collect `tps.slug`;
+    add `third_party_service_slug` to `ResolvedPlugin`.
+  - `resolve_analysis_plugins`: collect `tps.slug` on the TPS path into
+    the resolved entry so the analysis context can inject it.
+- `src/imbi_api/plugins/lifecycle_dispatch.py`
+  - `LifecycleContextBundle` + `build_lifecycle_context_bundle`: add
+    `project_exists_in` via `lookup_project_exists_in` in the
+    `asyncio.gather`.
+  - `_invoke_one` (`:245-294`): capture `ctx.service_writeback` in the
+    `_call` closure and `persist_service_writeback` after the call,
+    alongside the existing link writeback.
+  - PluginContext build (`:172`): inject `third_party_service_slug`
+    (from `ResolvedPlugin`) and `service_connections` (from bundle).
+- `src/imbi_api/endpoints/project_analysis.py`
+  - `_build_context` (`:92`): inject `third_party_service_slug` +
+    `service_connections` (add `lookup_project_exists_in`).
+- `src/imbi_api/endpoints/projects.py`
+  - `_RETURN_FRAGMENT` + slim fragment (`:845-902`): `OPTIONAL MATCH
+    (p)-[ei:EXISTS_IN]->(tps:ThirdPartyService)` and `collect({slug,
+    identifier, canonical_url})`.
+  - `ProjectResponse` (`:214-258`): merge edge `identifier` into
+    `identifiers` keyed by TPS slug (edge wins); add new
+    `canonical_urls: dict[str, str] = {}` keyed by TPS slug.
+- `src/imbi_api/endpoints/webhooks.py` + `src/imbi_api/domain/models.py`
+  - Rename `canonical_link` → `canonical_url` in the 3 EXISTS_IN queries
+    and in `ExistsInCreate` / `ExistsInResponse` (`:1268-1286`).
+- Tests: `persist_service_writeback` (upsert/remove/links-merge),
+  resolution TPS-slug surfacing, lifecycle capture+persist, analysis
+  context injection, `ProjectResponse` surfacing + collision precedence,
+  EXISTS_IN endpoints under the renamed property.
+
+### imbi-plugin-github
+- `src/imbi_plugin_github/lifecycle.py` — replace the 5
+  `LinkWriteback(link_key='github-repository', ...)` sites
+  (`:221,238,288,368,557`) with `ServiceWriteback(identifier=<repo id>,
+  canonical_url=<API /repositories/{id}>, dashboard_links={<tps_slug>:
+  html_url})`; on delete/relocate-away use `remove=True`. Construct the
+  API base via the existing `_api_base` / `_hosts.py` helpers.
+- `src/imbi_plugin_github/_repos.py` — `derive_owner_repo_from_links`:
+  read the dashboard link under the TPS slug from `ctx.project_links`,
+  with a transition fallback to the legacy `github-repository` key. (The
+  repo `id` from `ctx.service_connections` is the durable handle; the
+  id-based canonical URL is rename-stable, so renames only rewrite the
+  dashboard link, not the edge.)
+- Tests: writeback shape per hook; read-path fallback.
+
+### imbi-plugin-doctor (new package)
+- New repo/submodule mirroring an existing `imbi-plugin-*` layout
+  (`pyproject.toml`, `src/imbi_plugin_doctor/`, registry entry-point).
+- `EXISTS_IN` `AnalysisPlugin` (`plugin_type='analysis'`) with options
+  model (validated `Plugin.options` → `assignment_options`):
+  `identifier_pointer: JsonPointer` (extract id from canonical payload),
+  `dashboard_link_key: str` (which `Project.links` key holds the
+  dashboard URL; default = bound TPS slug), `content_type: str`.
+- `analyze(ctx, credentials)`: resolve the connection for
+  `ctx.third_party_service_slug` from `ctx.service_connections`; GET
+  `canonical_url` (with creds) → `pass/warn/fail` on reachability + on
+  `identifier_pointer` value == edge `identifier`; GET the dashboard URL
+  from `ctx.project_links[dashboard_link_key]` → reachability. Missing
+  creds / missing connection → `skip`/`warn`, never `fail`.
+- Tests: pass/warn/fail/skip matrix with httpx mocked.
+
+### Operational (meta-repo, not a service PR)
+- One-time graph migration renaming the property:
+  `MATCH ()-[ei:EXISTS_IN]->() WHERE exists(ei.canonical_link) SET
+  ei.canonical_url = ei.canonical_link REMOVE ei.canonical_link` — ship
+  as `scripts/migrate-exists-in-canonical-url.py` following the existing
+  `scripts/migrate-boolean-attributes.py` pattern. Edge data-correction
+  (dashboard-vs-API outliers) is expected to be manual, surfaced by the
+  Doctor.
+- Update `imbi-orchestration/notes/imbi-api-graph-schema.md` (EXISTS_IN
+  property rename + that edges are now plugin-maintained).
+
+## Implementation outline (dependency order)
+
+1. **imbi-common** — `ServiceWriteback`, `ServiceConnection`,
+   `PluginContext` fields, exports, docs, round-trip tests. (No new
+   plugin type.)
+2. **imbi-api** — rename `canonical_link`→`canonical_url`; add
+   `lookup_project_exists_in` + `persist_service_writeback`; surface
+   TPS slug in resolution; wire lifecycle capture/persist + context
+   injection; analysis context injection; `ProjectResponse` surfacing.
+   Run `just lint` + `just test`.
+3. **imbi-plugin-github** — emit `ServiceWriteback`; migrate read path
+   with legacy fallback. Lint + test.
+4. **imbi-plugin-doctor** — scaffold package + the analysis plugin +
+   tests. Lint + test.
+5. **imbi-ui** — regenerate `api-generated.ts` against the running API
+   (user owns `npm run codegen:fetch`); no new components this pass.
+6. **Operational** — migration script + schema-note update (separate,
+   run against the target graph; not a code PR gate).
+
+## Tests
+
+- imbi-common: msgpack/`model_validate` round-trip of new context
+  fields; `ServiceWriteback` defaults.
+- imbi-api: `persist_service_writeback` upsert + `remove` + dashboard
+  merge; resolution surfaces `third_party_service_slug` for lifecycle &
+  analysis; lifecycle dispatch captures+persists the writeback; analysis
+  `_build_context` injects connections; `ProjectResponse` returns
+  `canonical_urls` and merged `identifiers` (edge-wins collision);
+  EXISTS_IN endpoints pass under `canonical_url`.
+- imbi-plugin-github: each hook emits the right `ServiceWriteback`;
+  read-path TPS-slug + legacy fallback.
+- imbi-plugin-doctor: pass/warn/fail/skip matrix (URL 404, identifier
+  mismatch, missing creds, missing connection).
+
+## Verification
+
+- Per submodule: `just lint` && `just test` (imbi-common, imbi-api,
+  imbi-plugin-github, imbi-plugin-doctor). Coverage ≥ the repo's
+  `fail_under`.
+- End-to-end against a local API (`just serve`):
+  1. Attach the GitHub lifecycle plugin to a GHEC ThirdPartyService;
+     create a project. Confirm an `EXISTS_IN` edge exists with the
+     numeric `identifier` and the `/repositories/{id}` `canonical_url`,
+     and a dashboard link under the TPS slug in `links`.
+     `curl -f .../projects/{id}` shows the id in `identifiers` and the
+     API URL in `canonical_urls`.
+  2. Attach `imbi-plugin-doctor` to the same TPS with
+     `identifier_pointer=/id`; run analysis
+     (`POST .../projects/{id}/analysis`). Confirm `pass` for a good
+     edge; hand-edit the edge to a wrong identifier / dashboard URL and
+     confirm `fail`/`warn`; remove creds and confirm `skip`/`warn`.
+  3. Rename the repo on GitHub; confirm the dashboard link self-heals
+     while `canonical_url` (id-based) stays stable.
+- Migration: run the rename script against a copy of the graph; confirm
+  no `canonical_link` remain and `/services` + project responses read
+  correctly.
+
+## Deferred (future passes)
+
+- SonarQube / Sentry plugins managing their own `EXISTS_IN` edges.
+- A dedicated imbi-ui services card (view/manage EXISTS_IN, surface
+  Doctor findings, derive dashboard links from `LinkDefinition.url_template`).
+- Retiring the legacy `github-repository` link key once all consumers
+  read the TPS-slug-keyed dashboard link.

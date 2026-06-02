@@ -216,7 +216,7 @@ A managed service / application.
   - `-[:DEPLOYED_IN]->(:Environment)` — cardinality `0..*`
   - `-[:HAS_RELEASE]->(:Release)` — cardinality `0..*`
   - `-[:DEPENDS_ON]->(:Project)` — cardinality `0..*`
-  - `-[:EXISTS_IN {identifier, canonical_link}]->(:ThirdPartyService)` — cardinality `0..*`
+  - `-[:EXISTS_IN {identifier, canonical_url}]->(:ThirdPartyService)` — cardinality `0..*` (maintained by lifecycle plugins via `ServiceWriteback`; `canonical_url` is the API URL)
   - `-[:USES_PLUGIN {…}]->(:Plugin)` — cardinality `0..*` (project-level
     plugin overrides)
   - `-[:HAS_ANALYSIS_REPORT]->(:AnalysisReport)` — cardinality `0..1`
@@ -445,7 +445,7 @@ others are created with hand-written Cypher.
 | `:DEPENDS_ON` | `Project` → `Project` | `endpoints/projects.py` | none |
 | `:DEPLOYED_IN` | `Project` → `Environment` | `models.Project.environments` | none |
 | `:DEPLOYED_TO` | `Release` → `Environment` | `models.Release.environments` | `ReleaseDeploymentEdge.deployments: list[DeploymentEvent]` |
-| `:EXISTS_IN` | `Project` → `ThirdPartyService` | `endpoints/webhooks.py` (project-services router) | `identifier`, `canonical_link` |
+| `:EXISTS_IN` | `Project` → `ThirdPartyService` | `endpoints/webhooks.py` (project-services router); lifecycle plugins via `ServiceWriteback` (`endpoints/_helpers.py:persist_service_writeback`) | `identifier`, `canonical_url` (API URL) |
 | `:GRANTS` | `Role` → `Permission` | `auth/seed.py`, `domain.models.Role.permissions` | none |
 | `:HAS_IDENTITY` | `User` → `IdentityConnection` | `identity/repository.py` | none |
 | `:HAS_PLUGIN` | `ThirdPartyService` → `Plugin` | `models.Plugin.service` (incoming) | none |
