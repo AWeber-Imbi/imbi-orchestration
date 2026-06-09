@@ -151,6 +151,16 @@ deep-link URLs.
   is **not** idempotent and cannot be applied in place on an
   existing cluster — that requires the rebuild in the deployment
   playbook below.
+- `[pull_request_mv]` predicate: the gateway's `type` re-encoding
+  (`type = 'webhook'` + `metadata.event_type` instead of the
+  resolved label in `type`) silently stops the MV from capturing
+  new PR webhooks. Update the predicate in `schemata.toml` to
+  match **both** encodings:
+  `(type = 'pull_request' OR (type = 'webhook' AND
+  CAST(metadata.event_type, 'String') = 'pull_request'))`. On
+  existing clusters the new predicate lands via the MV
+  drop/recreate in the playbook below (`CREATE … IF NOT EXISTS`
+  alone is a no-op against a live MV).
 - `src/imbi_common/models.py` — `Event` (≈ 896–921):
   `metadata` is already `dict[str, Any]` so no model change for
   `metadata.handlers`. Add `version: int = 0` so producers can
@@ -298,6 +308,10 @@ regenerated from the API's OpenAPI snapshot).
 - View correctness test: insert two rows with the same `id`
   and `version = 0, 1`; `SELECT * FROM events_latest WHERE id = ?`
   returns exactly the `version = 1` row.
+- MV predicate test: `schemata.toml [pull_request_mv]` matches both
+  the legacy encoding (`type = 'pull_request'`) and the new one
+  (`type = 'webhook'` + `metadata.event_type = 'pull_request'`).
+  (Matches `PullRequestMVSchemaTestCase` in imbi-common.)
 
 ### imbi-gateway
 
@@ -445,6 +459,20 @@ best-effort — scale the gateway to 0 for the window for a clean cut,
 or accept a small write gap; the swap is atomic, so imbi-api reads via
 `events_latest` stay up throughout.
 
+**Deploy ordering.** Deploy the new gateway (the one that writes
+`type = 'webhook'` + `metadata.event_type`) **before** running this
+playbook. The backfill in step 3 remaps legacy-encoded rows to the
+new form; any legacy-form rows written *after* the backfill (by an
+old gateway still running) would stay invisible to the
+webhook-history view, though the both-encodings MV predicate still
+captures their PR data. If the old gateway did write rows after the
+swap, re-run the step-3 remap semantics as a sweep:
+`INSERT INTO imbi.events (…) SELECT … , version + 1 FROM imbi.events
+WHERE type NOT IN ('webhook')` — note this fires `pull_requests_mv`
+again for PR rows, which is harmless (`pull_requests` is
+`ReplacingMergeTree(recorded_at)` keyed `(project_id, pr_id)` and its
+readers use `FINAL`).
+
 **Steps** (clustered shown; drop `ON CLUSTER …` and use the
 non-`Replicated` engine for single node):
 
@@ -470,15 +498,36 @@ non-`Replicated` engine for single node):
    PARTITION BY toYYYYMM(recorded_at)
    ORDER BY (project_id, id);
    ```
-3. Backfill (run on **one** replica; data replicates via Keeper). This
-   does **not** fire `pull_requests_mv` — that MV triggers on inserts
-   into `imbi.events`, not `events_v2`:
+3. Backfill (run on **one** replica; data replicates via Keeper),
+   **remapping legacy rows to the new `type` encoding** as they are
+   copied. Rows written before the webhook-history gateway change
+   carry the resolved per-source label in `type` (e.g.
+   `'pull_request'`, `'push'`) and have no `metadata.event_type`;
+   the webhook-history view filters `type = 'webhook'`, so without
+   this remap historical deliveries never appear in it. Rows already
+   in the new encoding pass through unchanged. This does **not**
+   fire `pull_requests_mv` — that MV triggers on inserts into
+   `imbi.events`, not `events_v2`:
    ```sql
    INSERT INTO imbi.events_v2
-   SELECT id, project_id, recorded_at, type, third_party_service,
-          attributed_to, metadata, payload, version
+     (id, project_id, recorded_at, type, third_party_service,
+      attributed_to, metadata, payload, version)
+   SELECT
+     id, project_id, recorded_at,
+     'webhook',
+     third_party_service, attributed_to,
+     if(type = 'webhook',
+        metadata,
+        CAST(jsonMergePatch(toJSONString(metadata),
+                            toJSONString(map('event_type', type))),
+             'JSON')),
+     payload, version
    FROM imbi.events;
    ```
+   (Every historical `events` row is a gateway-recorded webhook
+   delivery, so the blanket `'webhook'` category is correct. If
+   non-webhook rows ever predate this migration, guard the `type`
+   expression the same way as the `metadata` one.)
    For a very large table, backfill partition-by-partition
    (`… WHERE toYYYYMM(recorded_at) = <YYYYMM>`) to bound memory/time.
 4. Drop the materialized view **before** the swap. `DROP TABLE` on a
@@ -498,7 +547,11 @@ non-`Replicated` engine for single node):
    `imbi.events` is now the rebuilt table; `imbi.events_v2` is the old
    table — keep it as the rollback backup.
 6. Recreate the MV against the new `imbi.events` (verbatim from
-   `schemata.toml [pull_request_mv]`, placeholders resolved):
+   `schemata.toml [pull_request_mv]`, placeholders resolved). Note
+   the predicate matches **both** `type` encodings — recreating it
+   with the old `WHERE type = 'pull_request'` filter would leave the
+   MV attached but permanently inert, since the new gateway writes
+   `type = 'webhook'`:
    ```sql
    CREATE MATERIALIZED VIEW IF NOT EXISTS imbi.pull_requests_mv
    ON CLUSTER '<name>' TO imbi.pull_requests AS
@@ -525,7 +578,9 @@ non-`Replicated` engine for single node):
        CAST(payload.pull_request.changed_files, 'UInt32') AS changed_files,
        recorded_at
    FROM imbi.events
-   WHERE type = 'pull_request'
+   WHERE (type = 'pull_request'
+          OR (type = 'webhook'
+              AND CAST(metadata.event_type, 'String') = 'pull_request'))
      AND third_party_service = 'github-enterprise-cloud'
      AND CAST(payload.action, 'String') IN ('opened', 'closed', 'reopened');
    ```
@@ -543,10 +598,20 @@ SHOW CREATE TABLE imbi.events;         -- confirm ReplacingMergeTree(version) + 
 OPTIMIZE TABLE imbi.events FINAL;      -- force-collapse
 SELECT count() AS rows, uniqExact(id) AS ids FROM imbi.events;  -- rows == ids after FINAL
 SELECT count() FROM imbi.events_latest;
+SELECT count() FROM imbi.events WHERE type != 'webhook';
+                                       -- 0: step-3 remap covered every legacy row
+SHOW CREATE TABLE imbi.pull_requests_mv;
+                                       -- predicate matches BOTH type encodings
 ```
 Optional two-phase smoke test: insert a `version=0` then `version=1`
 row with the same `id`; `events_latest` must return the `version=1`
 row, and after `OPTIMIZE … FINAL` the base table keeps only it.
+
+End-to-end MV check (the one failure mode none of the above
+catches): with the new gateway live, deliver (or redeliver) a real
+PR webhook and confirm a new row lands in `imbi.pull_requests` —
+this proves the recreated MV actually fires on the new `type =
+'webhook'` encoding, not just that it exists.
 
 **Rollback** (before dropping the backup): `EXCHANGE TABLES
 imbi.events AND imbi.events_v2 ON CLUSTER '<name>';` then recreate the
