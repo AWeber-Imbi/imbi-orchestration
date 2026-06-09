@@ -379,3 +379,168 @@ End-to-end spot-checks once each submodule has its changes:
    - `imbi-gateway`: `just lint && just test`.
    - `imbi-api`: `just lint && just test`.
    - `imbi-ui`: lint + test.
+
+## Deployment — events table migration playbook
+
+This feature changes the `events` engine to
+`ReplacingMergeTree(version)` and its sort key to `(project_id, id)`
+so the phase-0/phase-1 writes coalesce. On a **fresh** install
+`setup_schema()` creates the table correctly. On an **existing**
+cluster it does not — and that path needs the manual rebuild below.
+
+**Why it's manual, not a `setup_schema()` run.** The `events` table
+predates this feature and already exists on deployed clusters with
+`ENGINE = {replicated}MergeTree()` / `ORDER BY (project_id,
+recorded_at)`. ClickHouse cannot change a table's **engine** or its
+**leading sort key** in place (`ALTER … MODIFY ORDER BY` only
+*appends* columns), and every `schemata.toml` statement is
+`CREATE … IF NOT EXISTS`, so re-running `setup_schema()` is a **no-op
+for the existing table**. There is also no automated schema-apply
+step: `setup_schema()` is only invoked by the interactive `imbi-api
+setup` wizard (`entrypoint.py:242`, via `just bootstrap` → `kubectl
+exec -it … imbi-api setup`); the Helm chart has no migration
+`Job`/hook. The additive pieces (the `version` column via
+`events_add_version`, the `events_latest` view) *can* ride along on a
+`setup_schema()` run; the engine/sort-key change must be a hand-run
+rebuild, per cluster.
+
+**Drop-and-recreate is not acceptable** — `events` is not disposable.
+It backs the dashboard webhook-volume series (`dashboard.py:323`,
+`FROM events WHERE recorded_at >= …`) and is the source for the
+`pull_requests` materialized view. (Deployment records live in
+`operations_log` + the AGE graph, which this migration doesn't touch.)
+So we rebuild while preserving rows.
+
+**Placeholders.** Resolve as `setup_schema()` does: clustered →
+`{on_cluster}` = `ON CLUSTER '<name>'`, `{replicated}` = `Replicated`
+(engine `ReplicatedReplacingMergeTree(version)`); single-node → both
+empty (engine `ReplacingMergeTree(version)`, no `ON CLUSTER`). Run via
+`clickhouse-client` against the cluster.
+
+**Pre-flight.** Confirm clustered vs. single node (`echo
+$CLICKHOUSE_CLUSTER_NAME`). `events` writes from imbi-gateway are
+best-effort — scale the gateway to 0 for the window for a clean cut,
+or accept a small write gap; the swap is atomic, so imbi-api reads via
+`events_latest` stay up throughout.
+
+**Steps** (clustered shown; drop `ON CLUSTER …` and use the
+non-`Replicated` engine for single node):
+
+1. Ensure the discriminator column exists (idempotent; lets the
+   backfill `SELECT version`):
+   ```sql
+   ALTER TABLE imbi.events ON CLUSTER '<name>'
+     ADD COLUMN IF NOT EXISTS version UInt8 DEFAULT 0;
+   ```
+2. Create the rebuilt table under a temporary name:
+   ```sql
+   CREATE TABLE imbi.events_v2 ON CLUSTER '<name>' (
+     id                   String           DEFAULT '',
+     project_id           LowCardinality(String),
+     recorded_at          DateTime64(3, 'UTC'),
+     type                 LowCardinality(String) DEFAULT '',
+     third_party_service  LowCardinality(String) DEFAULT '',
+     attributed_to        LowCardinality(String) DEFAULT '',
+     metadata             JSON,
+     payload              JSON,
+     version              UInt8 DEFAULT 0
+   ) ENGINE = ReplicatedReplacingMergeTree(version)
+   PARTITION BY toYYYYMM(recorded_at)
+   ORDER BY (project_id, id);
+   ```
+3. Backfill (run on **one** replica; data replicates via Keeper). This
+   does **not** fire `pull_requests_mv` — that MV triggers on inserts
+   into `imbi.events`, not `events_v2`:
+   ```sql
+   INSERT INTO imbi.events_v2
+   SELECT id, project_id, recorded_at, type, third_party_service,
+          attributed_to, metadata, payload, version
+   FROM imbi.events;
+   ```
+   For a very large table, backfill partition-by-partition
+   (`… WHERE toYYYYMM(recorded_at) = <YYYYMM>`) to bound memory/time.
+4. Drop the materialized view **before** the swap. `DROP TABLE` on a
+   `TO`-target MV removes only the trigger, **not** the
+   `pull_requests` data, so materialized rows are preserved:
+   ```sql
+   DROP TABLE IF EXISTS imbi.pull_requests_mv ON CLUSTER '<name>';
+   ```
+   (An MV's trigger is bound to its source storage; after `EXCHANGE`
+   it can stay attached to the *old* storage. Recreating it after the
+   swap guarantees it fires on the new `imbi.events`.)
+5. Atomic swap (requires the Atomic database engine — the modern
+   default):
+   ```sql
+   EXCHANGE TABLES imbi.events AND imbi.events_v2 ON CLUSTER '<name>';
+   ```
+   `imbi.events` is now the rebuilt table; `imbi.events_v2` is the old
+   table — keep it as the rollback backup.
+6. Recreate the MV against the new `imbi.events` (verbatim from
+   `schemata.toml [pull_request_mv]`, placeholders resolved):
+   ```sql
+   CREATE MATERIALIZED VIEW IF NOT EXISTS imbi.pull_requests_mv
+   ON CLUSTER '<name>' TO imbi.pull_requests AS
+   SELECT
+       project_id,
+       CAST(payload.pull_request.id, 'String')        AS pr_id,
+       CAST(payload.pull_request.number, 'UInt32')    AS pr_number,
+       CAST(payload.pull_request.title, 'String')     AS title,
+       CAST(payload.pull_request.html_url, 'String')  AS url,
+       CAST(payload.pull_request.state, 'String')     AS state,
+       CAST(payload.pull_request.user.login, 'String') AS author,
+       CAST(payload.pull_request.draft, 'Bool')       AS draft,
+       CAST(payload.pull_request.merged, 'Bool')      AS merged,
+       parseDateTime64BestEffort(
+           CAST(payload.pull_request.created_at, 'String')) AS created_at,
+       parseDateTime64BestEffort(
+           CAST(payload.pull_request.updated_at, 'String')) AS updated_at,
+       if(isNotNull(payload.pull_request.merged_at),
+           parseDateTime64BestEffort(
+               CAST(payload.pull_request.merged_at, 'String')),
+           NULL)                                      AS merged_at,
+       CAST(payload.pull_request.additions, 'UInt32')     AS additions,
+       CAST(payload.pull_request.deletions, 'UInt32')     AS deletions,
+       CAST(payload.pull_request.changed_files, 'UInt32') AS changed_files,
+       recorded_at
+   FROM imbi.events
+   WHERE type = 'pull_request'
+     AND third_party_service = 'github-enterprise-cloud'
+     AND CAST(payload.action, 'String') IN ('opened', 'closed', 'reopened');
+   ```
+   `events_latest` is a plain (non-materialized) view that resolves its
+   source by name at query time, so it reads the new table after the
+   swap with no action. (Create it from `schemata.toml [events_latest]`
+   if this cluster doesn't have it yet.)
+7. Resume gateway writes if you paused them.
+
+**Verification.**
+```sql
+SELECT count() FROM imbi.events;       -- rebuilt
+SELECT count() FROM imbi.events_v2;    -- old backup; should match (historical rows are all version 0)
+SHOW CREATE TABLE imbi.events;         -- confirm ReplacingMergeTree(version) + ORDER BY (project_id, id)
+OPTIMIZE TABLE imbi.events FINAL;      -- force-collapse
+SELECT count() AS rows, uniqExact(id) AS ids FROM imbi.events;  -- rows == ids after FINAL
+SELECT count() FROM imbi.events_latest;
+```
+Optional two-phase smoke test: insert a `version=0` then `version=1`
+row with the same `id`; `events_latest` must return the `version=1`
+row, and after `OPTIMIZE … FINAL` the base table keeps only it.
+
+**Rollback** (before dropping the backup): `EXCHANGE TABLES
+imbi.events AND imbi.events_v2 ON CLUSTER '<name>';` then recreate the
+MV against `imbi.events` again.
+
+**Cleanup** (after a soak period): `DROP TABLE imbi.events_v2 ON
+CLUSTER '<name>';`
+
+**Keeper-path caveat.** `EXCHANGE TABLES` swaps names but not the
+underlying Keeper paths. If `default_replica_path` embeds `{table}`,
+the live `imbi.events` ends up with a path derived from `events_v2` —
+functional but cosmetically off. With `{uuid}` paths (Atomic default)
+this is a non-issue. Confirm the macro scheme before running in prod.
+
+**Broader gap (own follow-up):** there is no mechanism to apply
+*non-additive* ClickHouse changes — every engine/sort-key/partition
+change is a manual runbook like this until a non-interactive
+`imbi-api migrate-clickhouse` command or a Helm pre-upgrade `Job`
+exists.
