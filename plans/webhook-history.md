@@ -43,13 +43,21 @@ deep-link URLs.
     table forever; storage growth is bounded (≤ 2x event count).
   - The phase-2 insert is wrapped in `try/except` like phase 1;
     if it fails the phase-1 row is the source of truth.
-  - Discussed with a coworker: this is the agreed direction over
-    `ReplacingMergeTree` because it avoids changing the table
-    engine, the sort key, and any historical-row semantics.
+  - Engine choice (revised after review): the `events` table uses
+    `ReplacingMergeTree(version)`, so background merges collapse the
+    phase-0/phase-1 pair to the highest-`version` row per event. The
+    `events_latest` view is kept on top for read-after-write
+    correctness in the window before a merge runs. (An earlier draft
+    kept plain `MergeTree` and relied on the view alone, to avoid
+    touching the engine/sort key; that was reversed per reviewer
+    feedback — see imbi-common #159.)
 
 - **Schema changes on `events`.**
-  - Engine stays `MergeTree`. Sort key stays
-    `(project_id, recorded_at)`.
+  - Engine becomes `ReplacingMergeTree(version)`; sort key becomes
+    `(project_id, id)` so dedup keys on the event id. On an existing
+    cluster this needs the manual rebuild in the deployment playbook
+    below — neither the engine nor the leading sort key can be
+    altered in place.
   - Add column `version UInt8 DEFAULT 0`.
   - Create a sibling view `events_latest` (regular view, not
     materialized) that selects the highest-`version` row per
@@ -121,7 +129,11 @@ deep-link URLs.
 
 - `src/imbi_common/clickhouse/schemata.toml` (≈ lines 4–18):
   - Add column `version UInt8 DEFAULT 0` to the `events`
-    definition. Engine, partitioning, and sort key stay as-is.
+    definition. Change the engine to
+    `{replicated}ReplacingMergeTree(version)` and the sort key to
+    `(project_id, id)`; partitioning stays `toYYYYMM(recorded_at)`.
+    (For fresh installs the `CREATE … IF NOT EXISTS` applies these;
+    existing clusters need the rebuild playbook below.)
   - Add a `events_latest` view definition alongside the table:
     a regular `CREATE VIEW` that returns one row per `id` using
     `row_number() OVER (PARTITION BY id ORDER BY version DESC,
@@ -132,10 +144,13 @@ deep-link URLs.
     dedicated migration step).
   - `metadata.handlers` is a free-form JSON array; no separate
     column required.
-- Migration step: an idempotent `ALTER TABLE events ADD COLUMN
-  IF NOT EXISTS version UInt8 DEFAULT 0` plus a
-  `CREATE VIEW IF NOT EXISTS events_latest AS ...`. Existing
-  rows acquire `version = 0` automatically.
+- Migration step: the additive parts are idempotent — `ALTER TABLE
+  events ADD COLUMN IF NOT EXISTS version UInt8 DEFAULT 0` plus a
+  `CREATE VIEW IF NOT EXISTS events_latest AS ...` (existing rows
+  acquire `version = 0` automatically). The engine/sort-key change
+  is **not** idempotent and cannot be applied in place on an
+  existing cluster — that requires the rebuild in the deployment
+  playbook below.
 - `src/imbi_common/models.py` — `Event` (≈ 896–921):
   `metadata` is already `dict[str, Any]` so no model change for
   `metadata.handlers`. Add `version: int = 0` so producers can
@@ -242,12 +257,14 @@ deep-link URLs.
 
 ## Implementation outline (dependency-ordered)
 
-1. **imbi-common** — schema migration: add `version UInt8
-   DEFAULT 0` to the `events` table and create the
-   `events_latest` view that selects one row per `id` by highest
-   `version`. Update the `Event` model. Verify migration replays
-   cleanly on a fresh local ClickHouse and on one with existing
-   rows.
+1. **imbi-common** — schema: set the `events` engine to
+   `ReplacingMergeTree(version)` and sort key to `(project_id, id)`,
+   add `version UInt8 DEFAULT 0`, and create the `events_latest`
+   view that selects one row per `id` by highest `version`. Update
+   the `Event` model. On fresh ClickHouse the `CREATE … IF NOT
+   EXISTS` applies it all; the additive `ALTER`/view replay cleanly
+   on a cluster with existing rows, but the engine/sort-key change
+   there is the manual rebuild (deployment playbook below).
 2. **imbi-gateway** — two-phase recording: phase 1 stays where
    it is, phase 2 inserts after `_run_handlers`; `_record_events`
    accepts `version` and `handlers`. Tests cover the
@@ -270,9 +287,14 @@ regenerated from the API's OpenAPI snapshot).
 
 ### imbi-common
 
-- Migration test: applying the new schema to a table with
-  pre-existing rows preserves all rows, assigns `version = 0`,
-  and creates the `events_latest` view.
+- Schema test: `schemata.toml` declares the `events` engine as
+  `{replicated}ReplacingMergeTree(version)` with sort key
+  `(project_id, id)`, the `version UInt8 DEFAULT 0` column, and the
+  `events_latest` view. (Matches `test_events_engine` /
+  `EventsLatestViewSchemaTestCase` in imbi-common.)
+- Additive-migration test: replaying `events_add_version` + the
+  view on a table with pre-existing rows preserves all rows and
+  assigns `version = 0`.
 - View correctness test: insert two rows with the same `id`
   and `version = 0, 1`; `SELECT * FROM events_latest WHERE id = ?`
   returns exactly the `version = 1` row.
