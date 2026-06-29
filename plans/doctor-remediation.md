@@ -98,6 +98,26 @@ User-confirmed choices (verbatim where it matters):
    `remediate()` is only invoked for such findings (a defensive default
    raises `PluginRemediationNotSupported`).
 
+9. **GitHub doctor is a single host-agnostic plugin (post-consolidation
+   reconciliation).** The plugin-consolidation merge
+   (imbi-plugin-github #41) deleted the per-flavor plugin pattern this
+   plan was originally written against. The doctor collapses from three
+   per-flavor classes (`github-doctor` / `-ec` / `-es`) into one
+   `github-doctor` `AnalysisPlugin` that resolves the GitHub host from
+   the `github-connection` plugin via
+   `resolve_connection_host(ctx.service_plugins, 'github-doctor')`, the
+   same way the consolidated identity/deployment/lifecycle plugins do.
+   When no `github-connection` sibling is attached, `analyze()` returns
+   a single `connection` warn and `remediate()` returns `failed`.
+
+10. **Static credentials come from the `github-connection` plugin.** The
+    doctor declares **no credential field of its own**; the host already
+    sources the shared App/PAT off the `github-connection` sibling
+    (`imbi-api` `get_plugin_credentials`) and prefers the acting user's
+    identity token (decision 3) on top. This keeps the doctor consistent
+    with the consolidation's "shared creds on the connection plugin"
+    rule.
+
 ## Critical files
 
 ### imbi-common (publish first — consumers pin to it)
@@ -114,21 +134,30 @@ Reference (read-only): `base.py` `LifecycleResult`/`ServiceWriteback`/
 
 ### imbi-plugin-github
 
+> **Reconciled onto the plugin-consolidation merge (#41).** This section
+> was rewritten after the consolidation landed on `main`. See decisions
+> 9 and 10. The branch was rebased onto the consolidated `main`; the
+> doctor is now a single host-agnostic plugin.
+
 | File | Change |
 |---|---|
-| `src/imbi_plugin_github/doctor.py` | Attach `RemediationOffer` to fixable findings in `analyze()`; implement `remediate(ctx, credentials, remediation_id)`. |
-| `tests/test_doctor.py` | Remediation tests (respx). |
+| `src/imbi_plugin_github/doctor.py` | Single `GitHubDoctorPlugin` (`slug='github-doctor'`, no options, no credentials). `analyze()` resolves the host via `resolve_connection_host(ctx.service_plugins, 'github-doctor')` and attaches `RemediationOffer`s to fixable findings; `remediate(ctx, credentials, remediation_id)` re-fetches the repo and sets `ctx.service_writeback` / `ctx.link_writeback` **directly** (it does *not* reuse lifecycle's `_record_repo`). |
+| `src/imbi_plugin_github/__init__.py` | Export only `GitHubDoctorPlugin`. |
+| `pyproject.toml` | Single `github-doctor` entry point (drop `-ec` / `-es`). TEMP `[tool.uv.sources]` local-path pin to `../imbi-common` (= `main` + remediation contract) until imbi-common publishes. |
+| `tests/test_doctor.py` | Build a `github-connection` `ServicePlugin` in the ctx fixture; cover the missing-connection warn path; remediation tests (respx). |
 
-Reference (read-only): `src/imbi_plugin_github/lifecycle.py:557-602`
-(`_record_repo` / `_repo_html_url` — reuse for writeback emission);
-`src/imbi_plugin_github/_hosts.py`, `_repos.py`.
+Reference (read-only): `src/imbi_plugin_github/_hosts.py`
+(`resolve_connection_host`, `host_to_api_base`), `_repos.py`
+(`derive_owner_repo_from_links`), `connection.py`
+(`GitHubConnectionPlugin`). Writeback shapes (`ServiceWriteback` /
+`LinkWriteback`) come from `imbi_common.plugins.base`.
 
 ### imbi-api
 
 | File | Change |
 |---|---|
 | `src/imbi_api/plugins/resolution.py` | `resolve_analysis_plugins`: also resolve the sibling identity plugin on the TPS and set `ResolvedPlugin.identity_plugin_id`. |
-| `src/imbi_api/endpoints/project_analysis.py` | `_run_one` gains `auth`, wraps `analyze()` in `attach_identity` + `call_with_identity_retry`; `IdentityRequiredError` → `warn` finding. New `POST .../analysis/remediate` and `POST .../analysis/remediate-all`. Remove `apply-blueprint-defaults`. |
+| `src/imbi_api/endpoints/project_analysis.py` | `_run_one` gains `auth`, wraps `analyze()` in `attach_identity` + `call_with_identity_retry`; `IdentityRequiredError` → `warn` finding. New `POST .../analysis/remediate` and `POST .../analysis/remediate-all`. Remove `apply-blueprint-defaults`. **Post-consolidation:** `_build_context` must also populate `service_plugins` via `resolve_service_plugins(db, project_id)` — the host-agnostic GitHub doctor resolves its host from the `github-connection` sibling, so an empty `service_plugins` makes every analysis return the `connection` warn. (Stub `resolve_service_plugins` in the endpoint tests.) |
 | `src/imbi_api/blueprint_compliance.py` | Findings carry `RemediationOffer`s; add `remediate_blueprint(db, project_id, type_slugs, remediation_id) -> RemediationResult` (single-property set/remove). |
 
 Reference (read-only):
@@ -155,15 +184,17 @@ Reference (read-only):
    optional `remediate()`, the two errors; export + docs. Bump version
    and publish (or use the established temp `uv.sources` pin in
    consumers during dev — see the meta-repo's pending-cleanup notes).
-2. **imbi-plugin-github** — `doctor.analyze()` attaches offers;
-   `doctor.remediate()`:
+2. **imbi-plugin-github** (single host-agnostic `github-doctor`; host
+   from `resolve_connection_host(ctx.service_plugins, ...)`) —
+   `doctor.analyze()` attaches offers; `doctor.remediate()`:
    - `identifier-match` / `canonical-url-shape` / `dashboard-url-match`
-     → re-fetch the repo, emit
-     `ServiceWriteback(identifier=str(api_id),
+     → re-fetch the repo, set `ctx.service_writeback =
+     ServiceWriteback(identifier=str(api_id),
      canonical_url=f'{api_base}/repositories/{api_id}',
-     dashboard_links={slug: html_url})` (via the shared `_record_repo`).
-   - `github-repository-link-match` → emit
-     `LinkWriteback(link_key='github-repository', new_url=html_url)`.
+     dashboard_links={slug: html_url})` **directly** (no `_record_repo`).
+   - `github-repository-link-match` → set
+     `ctx.link_writeback = LinkWriteback(link_key='github-repository',
+     new_url=html_url)`.
    - `exists-in` (missing edge) → recreate via the same writeback.
 3. **imbi-api**
    - `resolution.resolve_analysis_plugins`: sibling-identity resolution.
@@ -188,16 +219,22 @@ Reference (read-only):
 - **imbi-common**: `RemediationOffer`/`RemediationResult` model
   validation; `AnalysisResultItem.remediation` default `None`;
   base `remediate()` raises `PluginRemediationNotSupported`.
-- **imbi-plugin-github** (`tests/test_doctor.py`, respx): each fixable
-  finding's `analyze()` carries the expected offer; `remediate()`
-  emits the correct `ServiceWriteback` / `LinkWriteback`; `noop` when
-  already correct; `remediate()` for an unknown id raises; 401 during
-  remediate surfaces as `failed` (and triggers the host retry path in
-  the api tests).
+- **imbi-plugin-github** (`tests/test_doctor.py`, respx): the ctx
+  fixture builds a `github-connection` `ServicePlugin` (host resolution
+  source); a missing `github-connection` sibling yields a single
+  `connection` warn; the manifest declares no options and no
+  credentials; each fixable finding's `analyze()` carries the expected
+  offer; `remediate()` sets the correct `ServiceWriteback` /
+  `LinkWriteback`; `noop` when already correct; `remediate()` for an
+  unknown id raises; 401 during remediate surfaces as `failed` (and
+  triggers the host retry path in the api tests).
 - **imbi-api**:
   - `resolve_analysis_plugins` sets `identity_plugin_id` from the
     sibling identity plugin; tiebreak by `used_as_login`; unset when
     none.
+  - `_build_context` populates `service_plugins`
+    (`resolve_service_plugins` stubbed); without it the host-agnostic
+    doctor degrades to the `connection` warn.
   - `_run_one` hydrates identity, retries once on 401,
     `IdentityRequiredError` → `warn` finding.
   - `POST .../analysis/remediate` persists the writeback (assert the
@@ -235,9 +272,12 @@ npm run lint && npm test
 End-to-end spot-check (okteto dev env, project `dOMnDfJCBIaDAmH2GfOHn`
 on the `github` TPS, GHEC Doctor instance attached):
 
-1. With a connected GitHub identity and **no** static `access_token`,
-   run analysis → body-dependent checks resolve (no longer all-`warn`),
-   confirming per-user creds via the sibling identity plugin.
+1. With a connected GitHub identity and **no** static `access_token` on
+   the `github-connection` plugin, run analysis → body-dependent checks
+   resolve (no longer all-`warn`), confirming per-user creds via the
+   sibling identity plugin. (The doctor no longer carries its own
+   `access_token`; the static fallback, when present, lives on the
+   `github-connection` plugin.)
 2. Corrupt the `EXISTS_IN` identifier in the graph; re-run → the
    `identifier-match` finding shows a **Fix** button; click → toast
    "fixed"; report refreshes to `pass`; confirm the edge was rewritten:
