@@ -199,6 +199,43 @@ they're branded as a set so reviewers can see the whole feature.
 8. **Hand off the URLs.** End-of-stage summary lists every PR URL,
    plus any pending CI failures or review threads.
 
+## Cross-service dependency pins
+
+Imbi services depend on the shared libraries (`imbi-common`,
+`imbi-plugin-*`). A committed `pyproject.toml` / `uv.lock` must be
+**valid in every context** — a fresh clone, CI, the other developer's
+differently-laid-out workspace, and the Docker build in the meta-repo.
+That rules out anything that points at a sibling checkout.
+
+- **Never** add `[tool.uv.sources]` `path = "../…"` / `editable`
+  entries, or `override-dependencies`, for a sibling library to a
+  submodule's committed files. Relative paths don't exist in the Docker
+  build context or in CI, and they differ per workspace — so they always
+  have to be reverted before pushing. That treadmill is what this rule
+  exists to end. There are no "TEMP, remove before PR" pins.
+- **Committed pins always name a published version.** During a feature
+  that needs *unreleased* sibling-library code, the consumer's pin stays
+  at the currently-published version; the unreleased code reaches your
+  environment through the meta-repo overlay, not through a committed
+  file (see `imbi-development` — `runtime/local-sources` for local venvs,
+  `runtime/wheels` baked into Docker images).
+- **Publish the library first, then bump the consumer.** Bumping a
+  consumer's pin to the new version and re-locking is a *permanent
+  forward change* committed in that consumer's PR — do it only once the
+  library is actually published to the index. It is not a patch to be
+  reverted. This is why the merge order publishes `imbi-common` (and any
+  changed plugins) before the API/UI/gateway PRs that depend on them go
+  green.
+- **Release the library in its own commit, never in a feature PR.**
+  Publishing a shared library is a dedicated `Bump version to X.Y.Z`
+  commit (version bump only) that lands on the library's `main` *after*
+  its feature PR merges, then is tagged `vX.Y.Z` — the tag publishes.
+  Never inline a version bump into a feature commit or carry it inside a
+  feature PR: the feature PR is reviewed and merged unversioned, and the
+  release is cut separately (prefer the `imbi-development-skills:release`
+  skill). Per-repo release specifics live in each library's `CLAUDE.md`
+  (e.g. `imbi-common/CLAUDE.md`).
+
 ## Conventions (apply across submodules unless overridden)
 
 - **Search:** `rg` only. `rg -t py PATTERN`, `rg -g '*.tsx' PATTERN`,
